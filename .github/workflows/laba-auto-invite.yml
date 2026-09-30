@@ -1,0 +1,389 @@
+# LABA First Contribution —— 通过 Issue 自助申请仓库贡献（Write）权限
+#
+# 目标流程：
+#   Issue Form 提交 → 本 workflow 触发 → 从事件上下文取申请人 login
+#   → 调用 GitHub REST API 发送 push 权限 collaborator 邀请 → 评论结果 → 打 label → 关闭 Issue
+#
+# ─── 安全设计说明（为什么这么写） ──────────────────────────────────────────────
+#
+# 1. 【识别严格化】只有「Issue Form 提交的 LABA 权限申请」才触发授权，普通 Issue 一律忽略。
+#    job 级先过滤 title 前缀 [LABA Access]，再由 validate 步骤校验 body 必须含表单固定结构。
+#    label laba-access 作为额外的识别信号，由 laba-sync-issue-labels.yml 负责补齐
+#    （GitHub 不会在 Issue 创建时自动应用 Issue Form 的 labels 字段，这是平台已知行为）。
+#
+# 2. 【不信任用户输入】申请人 login 只从 github.event.issue.user.login 读取，
+#    绝不解析 Issue 正文来「猜」用户名，也绝不接受用户在正文里自报 username。
+#
+# 3. 【凭据隔离】授权需要 Repository Administration 权限，而默认 GITHUB_TOKEN 没有该权限
+#    （且 GitHub 不允许给 GITHUB_TOKEN 授予 administration 写权限）。
+#    因此使用外部凭据 secrets.LABA_REPO_ADMIN_TOKEN（fine-grained PAT）。
+#    - 该 secret 仅通过 env: 注入，绝不直接拼进 run 脚本字符串，避免表达式注入
+#    - 该 secret 绝不写入文件、绝不 echo 到日志
+#    - 我们显式 ::add-mask:: 一次，作为对运行日志的额外保护
+#
+# 4. 【最小权限】GITHUB_TOKEN 只申请 issues: write（发评论/打 label/关闭）与 contents: read。
+#    不申请 administration、不申请 pull-requests，Workflow 自身的 token 无法提权。
+#
+# 5. 【防滥用】「发送仓库贡献权限邀请」步骤做幂等检查：已是 collaborator /
+#    已有 pending invitation → 只评论不重复发送；Bot 账号与未勾选确认框一律拒绝。
+#    workflow 级 concurrency 保证同一 Issue 不会被并发重复执行。
+
+name: LABA Auto Invite
+
+on:
+  issues:
+    types: [opened]
+
+# 同一 Issue 的申请串行化：避免快速重复提交导致并发重复发送邀请。
+# cancel-in-progress: false 是有意为之 —— 授权类操作不能被中途取消。
+concurrency:
+  group: laba-auto-invite-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+# 默认拒绝所有权限，只给下面 job 显式需要的最小权限。
+permissions: {}
+
+jobs:
+  auto-invite:
+    name: 处理 LABA 贡献权限申请
+    runs-on: ubuntu-latest
+
+    # ── 前置校验在 job 级别完成 ──────────────────────────────────────────────
+    # 只有标题像 LABA 权限申请的 Issue 才值得启动 runner。这里只做最粗的一层过滤，
+    # 细粒度校验（Bot 拒绝、body 结构、勾选确认框）交给下面的 validate 步骤，
+    # 原因是：Bot 申请也需要进入 job 才能被回复「申请失败」，若在此处拦截会变成静默忽略。
+    if: >-
+      github.event.issue.pull_request == null &&
+      startsWith(github.event.issue.title, '[LABA Access]')
+
+    permissions:
+      contents: read   # 只是为了满足 checkout/API 读取的基本需求，本 workflow 实际不需要写代码
+      issues: write    # 发评论、打 label、关闭 Issue
+
+    steps:
+      # ── 1. 严格校验：确认这确实是一份合法的 LABA 权限申请 ────────────────────
+      - name: 校验申请合法性
+        id: validate
+        env:
+          # 注意：这里传入的是不可信用户输入。只做只读校验，绝不拼接进 shell 命令。
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          APPLICANT: ${{ github.event.issue.user.login }}
+          APPLICANT_TYPE: ${{ github.event.issue.user.type }}
+        run: |
+          set -euo pipefail
+
+          echo "申请人 login: $APPLICANT"
+          echo "申请人类型: $APPLICANT_TYPE"
+
+          # --- 校验 1：标题前缀 ---
+          if [[ "$ISSUE_TITLE" != "[LABA Access]"* ]]; then
+            echo "::notice::标题不以 [LABA Access] 开头，跳过处理。"
+            echo "should_process=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # --- 校验 2：Bot 账号默认拒绝 ---
+          # 防御以 ... [bot] 结尾的应用账号（user.type 有时为 'User' 的边界情况）。
+          if [[ "$APPLICANT_TYPE" == "Bot" || "$APPLICANT" == *"[bot]" ]]; then
+            echo "::warning::申请由 Bot 账号 ($APPLICANT) 提交，按防滥用策略拒绝。"
+            echo "should_process=false" >> "$GITHUB_OUTPUT"
+            echo "reject_reason=bot" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # --- 校验 3：body 必须来自 Issue Form ---
+          # Issue Form 渲染后会产生固定标题，用它区分「真正提交表单」与「手写标题骗权限」。
+          if [[ "$ISSUE_BODY" != *"申请确认"* ]]; then
+            echo "::notice::Issue 正文不含表单固定结构，疑似手写 Issue，跳过。"
+            echo "should_process=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # --- 校验 4：必须已勾选确认框 ---
+          # Issue Form 的 checkbox 提交后在正文中渲染为 markdown 任务列表：
+          #   勾选 -> "- [X]" / "- [x]"；未勾选 -> "- [ ]"
+          #
+          # 为什么需要下面这两道判断，而不是简单 grep 一行 "- [x]"：
+          # 有人可以用 REST API 直接构造 Issue，绕过表单的 required 约束，
+          # 并在正文里塞入伪造的 "- [X] 假确认" 来蒙混过关。
+          # 表单字段本身是不可编辑的渲染结果，因此真正的确认框所在小节里
+          # 有且仅有 GitHub 渲染出的那 1 个任务项。
+          # 只要该小节内出现「多个任务项」或「第一个任务项未勾选」，一律视为不合法。
+          CONFIRM_BLOCK="$(awk '/^#+[[:space:]]*申请确认/{found=1} found' <<< "$ISSUE_BODY")"
+
+          # 统计确认小节内的任务列表项总数
+          ITEM_COUNT="$(grep -cE '^[[:space:]]*-[[:space:]]*\[[ xX]\]' <<< "$CONFIRM_BLOCK" || true)"
+          FIRST_ITEM="$(grep -m1 -E '^[[:space:]]*-[[:space:]]*\[[ xX]\]' <<< "$CONFIRM_BLOCK" || true)"
+
+          if [[ -z "$FIRST_ITEM" || "$ITEM_COUNT" != "1" ]]; then
+            echo "::warning::确认小节结构异常（任务项数量=$ITEM_COUNT），拒绝授权。"
+            echo "should_process=false" >> "$GITHUB_OUTPUT"
+            echo "reject_reason=unconfirmed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if grep -qiE '^[[:space:]]*-[[:space:]]*\[x\]' <<< "$FIRST_ITEM"; then
+            echo "确认框已勾选，且确认小节结构正常。"
+          else
+            echo "::warning::申请人未勾选确认框，拒绝授权。"
+            echo "should_process=false" >> "$GITHUB_OUTPUT"
+            echo "reject_reason=unconfirmed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "should_process=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::校验通过，准备为 $APPLICANT 申请仓库权限。"
+
+      # ── 2. 凭据检查：缺 secret 时给出明确报错，而不是静默失败 ────────────────
+      - name: 检查管理员凭据是否已配置
+        id: creds
+        if: steps.validate.outputs.should_process == 'true'
+        env:
+          ADMIN_TOKEN: ${{ secrets.LABA_REPO_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 只在本地判断是否为空，绝不打印 token 内容或长度以外的信息。
+          if [[ -z "${ADMIN_TOKEN:-}" ]]; then
+            echo "::error::未配置 secret LABA_REPO_ADMIN_TOKEN，无法发送仓库邀请。"
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            # 遮蔽日志中的 token 形态，作为防泄漏的最后一道保险。
+            echo "::add-mask::$ADMIN_TOKEN"
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 3. 核心逻辑：检查现有权限/邀请，然后按需发送邀请 ─────────────────────
+      - name: 发送仓库贡献权限邀请
+        id: invite
+        if: steps.validate.outputs.should_process == 'true' && steps.creds.outputs.configured == 'true'
+        uses: actions/github-script@v7
+        env:
+          # 凭据通过 env 注入，不进入 script 源码字符串。
+          ADMIN_TOKEN: ${{ secrets.LABA_REPO_ADMIN_TOKEN }}
+          APPLICANT: ${{ github.event.issue.user.login }}
+        with:
+          # 注意：github-token 用的是 GITHUB_TOKEN，只用于在 Issue 里发评论。
+          # 所有 Administration 类请求在脚本内部用 ADMIN_TOKEN 单独发起。
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // 固定目标：LABA 的 first-contributions 仓库，权限为 push（即 Write）。
+            const OWNER = 'wustLABA';
+            const REPO = 'first-contributions';
+            const PERMISSION = 'push';
+
+            const applicant = process.env.APPLICANT;
+            // token 从不打印；仅用于构造 Authorization 头。
+            const adminToken = process.env.ADMIN_TOKEN;
+
+            // 统一的 API 调用封装：只暴露状态码与业务错误信息，绝不回传请求头。
+            async function adminApi(method, path, body) {
+              const res = await fetch(`https://api.github.com${path}`, {
+                method,
+                headers: {
+                  'Accept': 'application/vnd.github+json',
+                  'Authorization': `Bearer ${adminToken}`,
+                  'X-GitHub-Api-Version': '2022-11-28',
+                  'User-Agent': 'laba-auto-invite',
+                  ...(body ? { 'Content-Type': 'application/json' } : {}),
+                },
+                ...(body ? { body: JSON.stringify(body) } : {}),
+              });
+              let data = null;
+              try { data = await res.json(); } catch { /* 204 无响应体是正常情况 */ }
+              return {
+                status: res.status,
+                ok: res.ok,
+                data,
+                // 只取 GitHub 给的 message 字段，避免把整个响应（可能含敏感上下文）塞进日志。
+                message: data && data.message ? data.message : '',
+              };
+            }
+
+            const results = { decision: 'unknown', detail: '' };
+            try {
+              // ── 情况 1：申请人已经是本仓库 collaborator（已有 Write 权限）────────
+              // 404 表示目前还不是协作者，属于正常路径。
+              const perm = await adminApi('GET', `/repos/${OWNER}/${REPO}/collaborators/${applicant}/permission`);
+              if (perm.ok && ['admin', 'write', 'maintain'].includes(perm.data?.permission)) {
+                results.decision = 'already_collaborator';
+                results.detail = `当前权限: ${perm.data.permission}`;
+                console.log(`申请人已是协作者，权限=${perm.data.permission}，无需重复邀请。`);
+              } else if (perm.status !== 404 && !perm.ok) {
+                // 非 404 的失败说明凭据或仓库配置有问题，直接抛出走失败分支。
+                throw new Error(`查询协作者权限失败: HTTP ${perm.status} ${perm.message}`);
+              } else {
+                // ── 情况 2：是否已有 pending invitation ──────────────────────────
+                // 逐页扫描本仓库待接受邀请，避免重复创建大量邀请。
+                let pending = null;
+                for (let page = 1; page <= 10 && !pending; page++) {
+                  const inv = await adminApi('GET', `/repos/${OWNER}/${REPO}/invitations?per_page=100&page=${page}`);
+                  if (!inv.ok) {
+                    throw new Error(`查询待接受邀请失败: HTTP ${inv.status} ${inv.message}`);
+                  }
+                  const list = Array.isArray(inv.data) ? inv.data : [];
+                  if (list.length === 0) break;
+                  pending = list.find((i) => i?.invitee?.login?.toLowerCase() === applicant.toLowerCase()) || null;
+                  if (list.length < 100) break;
+                }
+
+                if (pending) {
+                  results.decision = 'already_invited';
+                  results.detail = `邀请 ID: ${pending.id}`;
+                  console.log('已存在待接受的邀请，不重复发送。');
+                } else {
+                  // ── 情况 3：首次申请，创建邀请 ────────────────────────────────
+                  const created = await adminApi(
+                    'PUT',
+                    `/repos/${OWNER}/${REPO}/collaborators/${applicant}`,
+                    { permission: PERMISSION },
+                  );
+
+                  // 201 = 新邀请已创建；204 = 该用户此前已被添加（幂等成功）。
+                  if (created.status === 201 || created.status === 204) {
+                    results.decision = 'invited';
+                    results.detail = `HTTP ${created.status}`;
+                    console.log(`邀请发送成功（HTTP ${created.status}）。`);
+                  } else {
+                    throw new Error(`创建邀请失败: HTTP ${created.status} ${created.message}`);
+                  }
+                }
+              }
+            } catch (err) {
+              // 记录技术原因（不含 token/请求头），供管理员排障。
+              core.error(`授权流程异常: ${err.message}`);
+              results.decision = 'failed';
+              results.detail = err.message;
+            }
+
+            core.setOutput('decision', results.decision);
+            core.setOutput('detail', results.detail);
+
+      # ── 4. 按结果在 Issue 中回复 ─────────────────────────────────────────────
+      - name: 在 Issue 中回复处理结果
+        id: comment
+        if: steps.validate.outputs.should_process == 'true'
+        uses: actions/github-script@v7
+        env:
+          DECISION: ${{ steps.invite.outputs.decision }}
+          DETAIL: ${{ steps.invite.outputs.detail }}
+          CREDS_OK: ${{ steps.creds.outputs.configured }}
+          APPLICANT: ${{ github.event.issue.user.login }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const decision = process.env.DECISION || '';
+            const applicant = process.env.APPLICANT;
+
+            // 统一按 LABA 规定的话术回复。文案集中在此，便于后续统一修改。
+            const MESSAGES = {
+              already_collaborator:
+                `@${applicant} 你已经拥有 LABA First Contribution 仓库的贡献权限，无需重复申请。`,
+              already_invited:
+                `@${applicant} 你的仓库邀请已经发送，请前往 GitHub Notifications 或邮件中接受邀请。`,
+              invited:
+                `@${applicant} LABA First Contribution 权限邀请已发送。\n\n` +
+                `请先接受 GitHub 仓库邀请。\n\n` +
+                `接受后，你就可以 Clone：\n\n` +
+                `https://github.com/wustLABA/first-contributions.git\n\n` +
+                `之后请按照 LABA 指南完成你的第一次贡献。`,
+              failed:
+                `@${applicant} 自动权限申请暂时失败。\n\n请联系 LABA 管理员处理。`,
+            };
+
+            let body;
+            if (decision === 'failed' || !decision || decision === 'unknown') {
+              body = MESSAGES.failed;
+            } else {
+              body = MESSAGES[decision] || MESSAGES.failed;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+            core.setOutput('body_kind', body === MESSAGES.failed ? 'failed' : 'ok');
+
+      # ── 5. 打标签 + 按需关闭 Issue ───────────────────────────────────────────
+      - name: 打标签并关闭 Issue
+        if: steps.validate.outputs.should_process == 'true' && steps.comment.outputs.body_kind != ''
+        uses: actions/github-script@v7
+        env:
+          DECISION: ${{ steps.invite.outputs.decision }}
+          CREDS_OK: ${{ steps.creds.outputs.configured }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const decision = process.env.DECISION || '';
+            const credsOk = process.env.CREDS_OK === 'true';
+
+            // 只有「已发送邀请 / 已有邀请 / 已有权限」才算成功；其余一律按失败处理。
+            // 凭据未配置时 decision 为空，同样归入失败分支，保证绝不静默失败。
+            const success = credsOk && ['invited', 'already_invited', 'already_collaborator'].includes(decision);
+
+            const addLabel = success ? 'laba-access-approved' : 'laba-access-failed';
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: [addLabel],
+            });
+
+            if (success) {
+              // 成功路径：评论 → 打 approved 标签 → 关闭 Issue
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                state: 'closed',
+                state_reason: 'completed',
+              });
+              console.log(`处理成功，已添加 ${addLabel} 并关闭 Issue。`);
+            } else {
+              // 失败路径：保持开启，方便管理员人工接手。
+              console.log(`处理失败，已添加 ${addLabel}，Issue 保持开启等待人工处理。`);
+            }
+
+      # ── 6. 被拒绝申请的兜底回复（绝不授予任何权限）───────────────────────────
+      # 覆盖两种情况：
+      #   · bot      —— Bot 账号默认拒绝（防滥用第 4 条）
+      #   · unconfirmed —— 未勾选必填确认框（防滥用第 2 条）
+      # 设计上都必须给出明确回复而非静默失败，并打 failed 标签、保持 Issue 开启。
+      - name: 回复被拒绝的申请
+        if: |
+          steps.validate.outputs.reject_reason == 'bot' ||
+          steps.validate.outputs.reject_reason == 'unconfirmed'
+        uses: actions/github-script@v7
+        env:
+          REJECT_REASON: ${{ steps.validate.outputs.reject_reason }}
+          APPLICANT: ${{ github.event.issue.user.login }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const reason = process.env.REJECT_REASON;
+            const applicant = process.env.APPLICANT;
+
+            // 对外统一使用失败话术，不暴露内部判定细节（避免给探测者反馈信号）。
+            // 具体原因仅记录在 Actions 日志中，供管理员排查。
+            const internal = reason === 'bot'
+              ? `申请账号 ${applicant} 被识别为 Bot 账号，按防滥用策略拒绝。`
+              : `申请账号 ${applicant} 未勾选必填确认框，拒绝授权。`;
+            console.log(internal);
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `@${applicant} 自动权限申请暂时失败。\n\n请联系 LABA 管理员处理。`,
+            });
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ['laba-access-failed'],
+            });

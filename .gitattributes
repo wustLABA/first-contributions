@@ -1,0 +1,27 @@
+# 强制 LF 行尾，避免 Windows 贡献者提交触发 CRLF 转换
+#
+# 为什么需要这个文件：
+# 本仓库有 Windows 贡献者，其 Git 常配置 core.autocrlf=true。
+# 若 workflow 文件被转成 CRLF，runner 上的 bash 解析 run 脚本时
+# 会出现 `\r: command not found`、`set: invalid option` 之类的诡异报错。
+# 显式声明 text eol=lf 可消除对个人 Git 配置的依赖。
+#
+# 注意：这里只约束「新增的文本文件」，不改变仓库已有文件的既有行尾，
+# 以免产生大量无意义的 diff。
+
+# 工作流与 Issue 模板：必须是 LF
+.github/workflows/*.yml text eol=lf
+.github/ISSUE_TEMPLATE/*.yml text eol=lf
+.github/*.md text eol=lf
+
+# Shell 脚本：必须 LF，否则在 Linux 上无法执行
+*.sh text eol=lf
+
+# Markdown 文档：统一 LF，避免无意义的整文件 diff
+*.md text eol=lf
+
+# 二进制文件不做任何转换
+*.png binary
+*.jpg binary
+*.gif binary
+*.pdf binary

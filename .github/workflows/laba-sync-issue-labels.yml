@@ -1,0 +1,78 @@
+# 为 LABA 权限申请 Issue 自动补齐 laba-access 标签
+#
+# ─── 为什么需要这个文件 ──────────────────────────────────────────────────────
+# GitHub 的已知行为：Issue Form 的 `labels:` 字段在 issue **创建时不会自动应用**，
+# 只有管理员手动通过模板选择器创建时才会带上（见 GitHub 官方讨论 150729）。
+#
+# 但注册流程要求 laba-auto-invite.yml 使用「label + title」双重校验来识别申请，
+# 因此这里用一个独立的 workflow 在 issue opened 时把标签补上，形成完整闭环。
+#
+# 拆分而非合并的原因：
+# 1. 职责单一 —— 本文件只做「识别 + 打标签」，不碰任何凭据；
+# 2. 该 workflow 只需要 issues: write 权限，不需要接触 LABA_REPO_ADMIN_TOKEN，
+#    因此即便本 workflow 被滥用，攻击面也仅限「给公开 issue 打个标签」；
+# 3. 让 laba-auto-invite.yml 的 label 校验保持为真实有效的第二道防线。
+
+name: LABA Sync Issue Labels
+
+on:
+  issues:
+    types: [opened, reopened, edited]
+
+# 同一 Issue 串行处理，避免编辑时并发打标签产生重复请求。
+concurrency:
+  group: laba-sync-labels-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+# 默认无权限，按需最小授权。
+permissions: {}
+
+jobs:
+  sync-label:
+    name: 补齐 laba-access 标签
+    runs-on: ubuntu-latest
+
+    # 仅处理：非 PR、标题前缀正确、创建者非 Bot。
+    # 用 title 前缀作为唯一识别依据是安全的 —— 本 workflow 唯一的副作用就是打一个标签，
+    # 即使有人手写标题骗到标签，也不会获得任何仓库权限。
+    if: >-
+      github.event.issue.pull_request == null &&
+      startsWith(github.event.issue.title, '[LABA Access]') &&
+      github.event.issue.user.type != 'Bot'
+
+    permissions:
+      issues: write
+
+    steps:
+      - name: 添加 laba-access 标签
+        env:
+          # 传入不可信输入仅用于只读判断。
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          CURRENT_LABELS: ${{ join(github.event.issue.labels.*.name, ',') }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const body = process.env.ISSUE_BODY || '';
+            const current = (process.env.CURRENT_LABELS || '').split(',').map(s => s.trim());
+
+            // 二次确认这确实来自 Issue Form：表单渲染后必然包含固定字段标题。
+            // 这样手写的「标题像表单」的普通 Issue 不会被打上标签。
+            if (!body.includes('申请确认')) {
+              console.log('正文不含表单固定结构，跳过打标签。');
+              return;
+            }
+
+            // 已经有标签就不重复调用 API。
+            if (current.includes('laba-access')) {
+              console.log('已存在 laba-access 标签，跳过。');
+              return;
+            }
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ['laba-access'],
+            });
+            console.log('已添加 laba-access 标签。');

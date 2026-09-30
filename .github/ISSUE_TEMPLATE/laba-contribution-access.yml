@@ -1,0 +1,84 @@
+# LABA 招新：First Contribution 贡献权限自助申请表单
+#
+# 设计要点（为什么这么做）：
+# 1. 这是一个**公开** Issue Form，因此严禁收集姓名/学号/班级/邮箱等隐私信息。
+#    申请人的 GitHub 用户名由 Actions 从 issue.user.login 自动获取，不需要、也不允许用户填写。
+# 2. 不需要用户输入任何文本 —— 唯一交互是勾选确认框，把误填、乱填、注入的风险降到最低。
+# 3. title 前缀固定为 [LABA Access]，这是后续 workflow 识别本表单的**第一道**校验条件。
+# 4. labels 字段在此仅作声明用途：GitHub 在创建 issue 时不会自动应用 Issue Form 的 labels，
+#    因此真实 label 由 .github/workflows/laba-sync-issue-labels.yml 补齐，作为第二道校验条件。
+name: 申请 LABA First Contribution 权限
+description: 武汉科技大学 LABA 社团招新 —— 申请本仓库的贡献（Write）权限，随后即可 Clone 并提交你的第一个 Pull Request。
+title: "[LABA Access] 申请 First Contribution 权限"
+labels: ["laba-access"]
+assignees: []
+body:
+  # ── 引言：让新生一眼看懂「这是什么、点完会发生什么」 ──────────────────────
+  - type: markdown
+    attributes:
+      value: |
+        ## 欢迎参加 LABA First Contribution 招新活动 👋
+
+        这个 Issue 只做一件事：**自动帮你获得本仓库的贡献权限**。
+
+        你不需要 Fork 仓库，也不需要在这里填写任何个人信息。
+
+        点击下面的 `Submit new issue` 后，机器人会：
+
+        1. 读取你的 GitHub 账号（自动获取，无需填写）
+        2. 向你的账号发送本仓库的 **Write（push）权限邀请**
+        3. 在本 Issue 中回复处理结果并自动关闭
+
+        你之后需要做的，是去 **GitHub Notifications 或注册邮箱**里接受这条仓库邀请。
+
+        > [!WARNING]
+        > 本 Issue 是公开可见的，**请勿**在这里填写姓名、学号、班级、手机号、邮箱等任何个人隐私信息。
+
+  # ── 唯一的必填项：确认框 ──────────────────────────────────────────────────
+  # 为什么用 checkbox 而不是普通 markdown 文字：
+  # workflows 会解析本字段的勾选状态，未勾选的申请一律拒绝，这是防误触/防脚本批量提交的第三道校验。
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 申请确认
+      description: 请阅读以下内容后再勾选。
+      options:
+        - label: |
+            我确认希望申请 LABA First Contribution 仓库贡献权限。
+
+            我了解获得权限后需要自行完成：Clone 仓库 → 创建自己的 Branch → 完成报名文件 → Commit → Push → 创建 Pull Request。
+          required: true
+
+  # ── 流程指引：降低新生后续卡住、反复开 Issue 的概率 ────────────────────────
+  - type: markdown
+    attributes:
+      value: |
+        ---
+
+        ### 接下来会发生什么？
+
+        | 情况 | 机器人回复 |
+        | --- | --- |
+        | 首次申请 | 邀请已发送，请接受邀请 |
+        | 已经申请过、邀请还在等待接受 | 提醒你去接受邀请，**不会重复发送** |
+        | 你已经是贡献者 | 告知无需重复申请 |
+
+        权限邀请发送成功后，本 Issue 会被自动关闭并标记为 `laba-access-approved`。
+
+        如果自动发送失败，本 Issue 会保留开启并标记为 `laba-access-failed`，请等待 LABA 管理员人工处理。
+
+        ### 接受邀请之后
+
+        ```bash
+        git clone https://github.com/wustLABA/first-contributions.git
+        cd first-contributions
+        git checkout -b laba-<你的名字或学号>
+        # 新建你的报名文件，然后：
+        git add .
+        git commit -m "docs: add my LABA registration"
+        git push -u origin laba-<你的名字或学号>
+        ```
+
+        然后在 GitHub 上创建你的第一个 Pull Request 🎉
+
+        完整中文指南见 [`docs/zh-CN/laba-access.md`](https://github.com/wustLABA/first-contributions/blob/main/docs/zh-CN/laba-access.md)。
