@@ -89,6 +89,74 @@
 <kbd>[<img title="Tounsi" alt="Tounsi" src="https://cdn.statically.io/gh/hjnilsson/country-flags/master/svg/tn.svg" width="22">](docs/translations/README.tn.md)</kbd>
 <kbd>[<img title="Lingala" alt="Lingala" src="https://cdn.statically.io/gh/hjnilsson/country-flags/master/svg/cd.svg" width="22">](docs/translations/README.ln.md)</kbd>
 
+---
+
+# LABA First Contribution 招新
+
+这个仓库是武汉科技大学 LABA 社团的招新入口，也是很多同学**第一次真正用 Git 和 GitHub 做开源协作**的地方。
+
+你不需要先学会所有东西再来。跟着走一遍，你就会知道一次完整的协作长什么样。
+
+## 你会学到什么
+
+一次标准的开源协作流程：
+
+```text
+Fork → Clone → 建分支 → 改文件 → Commit → Push → Pull Request
+```
+
+每一步都有现成的命令可以抄，卡住了也有排查提示。
+
+## 做完之后：加入组织，拿到长期权限
+
+完成第一个 Pull Request 之后，你可以申请加入 **wustLABA** 组织。
+
+```text
+完成贡献
+   ↓
+申请加入 wustLABA Organization
+   ↓
+在 GitHub 通知里接受邀请
+   ↓
+自动加入 LABA-Members 团队
+   ↓
+获得团队名下项目的贡献权限
+```
+
+### 权限是怎么给的？
+
+**不是单独给某一个仓库开权限**，而是通过组织里的团队统一下发：
+
+```text
+wustLABA Organization
+        ↓
+LABA-Members Team
+        ↓
+Repository Write
+```
+
+这样设计的好处是：社团以后新开项目，只要把仓库加进 LABA-Members 团队，你就能直接参与，不用再申请一次。
+
+需要注意：进了组织**不等于**什么都能改。你能写哪些仓库，取决于管理员把哪些仓库放进了这个团队。
+
+## 怎么申请
+
+1. 打开本仓库的 **Issues → New issue**
+2. 选择 **「申请加入 wustLABA Organization」**
+3. 勾选确认框，提交
+
+剩下的交给机器人：它会读取你的 GitHub 账号，发一条组织邀请给你，然后在本 Issue 里回复结果。
+
+你唯一要做的是去 **GitHub 通知（右上角铃铛）或注册邮箱**里**接受这条邀请**。
+
+> 没接受邀请之前，`git push` 会报 403，这是最常见的新手卡点。
+
+详细步骤、常见问题、以及拿到权限后怎么提交第一个 PR，看这里：
+
+**📖 [完整中文指南](docs/zh-CN/laba-access.md)**
+
+---
+
 # First Contributions
 
 This project aims to simplify and guide the way beginners make their first contribution. If you are looking to make your first contribution, follow the steps below.

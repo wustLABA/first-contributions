@@ -1,8 +1,14 @@
-# LABA First Contribution —— 通过 Issue 自助申请仓库贡献（Write）权限
+# LABA First Contribution —— 通过 Issue 自助申请加入 wustLABA Organization 与 LABA-Members Team
 #
 # 目标流程：
 #   Issue Form 提交 → 本 workflow 触发 → 从事件上下文取申请人 login
-#   → 调用 GitHub REST API 发送 push 权限 collaborator 邀请 → 评论结果 → 打 label → 关闭 Issue
+#   → 调用 GitHub REST API 邀请加入 Organization → 加入 LABA-Members Team
+#   → 评论结果 → 打 label → 关闭 Issue
+#
+# 权限来源（重要）：
+#   用户的仓库写权限**不来自**本仓库的协作者授权，而是来自
+#   wustLABA Organization → LABA-Members Team → Repository permissions: Write。
+#   好处：今后新增项目只需在 Team 上勾选仓库，无需改动本 workflow。
 #
 # ─── 安全设计说明（为什么这么写） ──────────────────────────────────────────────
 #
@@ -14,8 +20,8 @@
 # 2. 【不信任用户输入】申请人 login 只从 github.event.issue.user.login 读取，
 #    绝不解析 Issue 正文来「猜」用户名，也绝不接受用户在正文里自报 username。
 #
-# 3. 【凭据隔离】授权需要 Repository Administration 权限，而默认 GITHUB_TOKEN 没有该权限
-#    （且 GitHub 不允许给 GITHUB_TOKEN 授予 administration 写权限）。
+# 3. 【凭据隔离】邀请加入 Organization 需要 Organization 的 Members 写权限，
+#    而默认 GITHUB_TOKEN 无法完成组织成员管理（平台限制，不是配置问题）。
 #    因此使用外部凭据 secrets.LABA_REPO_ADMIN_TOKEN（fine-grained PAT）。
 #    - 该 secret 仅通过 env: 注入，绝不直接拼进 run 脚本字符串，避免表达式注入
 #    - 该 secret 绝不写入文件、绝不 echo 到日志
@@ -23,10 +29,15 @@
 #
 # 4. 【最小权限】GITHUB_TOKEN 只申请 issues: write（发评论/打 label/关闭）与 contents: read。
 #    不申请 administration、不申请 pull-requests，Workflow 自身的 token 无法提权。
+#    本 workflow 也**不申请** contents: write —— 它从不写代码，只做组织成员管理。
 #
-# 5. 【防滥用】「发送仓库贡献权限邀请」步骤做幂等检查：已是 collaborator /
-#    已有 pending invitation → 只评论不重复发送；Bot 账号与未勾选确认框一律拒绝。
+# 5. 【防滥用】「邀请加入组织并同步 Team」步骤做幂等检查：已是 organization member /
+#    已有 pending 组织邀请 → 不重复发送，直接继续检查 Team 归属；
+#    Bot 账号与未勾选确认框一律拒绝。
 #    workflow 级 concurrency 保证同一 Issue 不会被并发重复执行。
+#
+# 6. 【绝不假装成功】凭据权限不足（HTTP 403）会被明确识别为 TOKEN_PERMISSION_INSUFFICIENT，
+#    打 failed label 并保持 Issue 开启，绝不伪造成功结果。
 
 name: LABA Auto Invite
 
@@ -133,7 +144,7 @@ jobs:
           fi
 
           echo "should_process=true" >> "$GITHUB_OUTPUT"
-          echo "::notice::校验通过，准备为 $APPLICANT 申请仓库权限。"
+          echo "::notice::校验通过，准备为 $APPLICANT 处理组织加入申请。"
 
       # ── 2. 凭据检查：缺 secret 时给出明确报错，而不是静默失败 ────────────────
       - name: 检查管理员凭据是否已配置
@@ -145,7 +156,7 @@ jobs:
           set -euo pipefail
           # 只在本地判断是否为空，绝不打印 token 内容或长度以外的信息。
           if [[ -z "${ADMIN_TOKEN:-}" ]]; then
-            echo "::error::未配置 secret LABA_REPO_ADMIN_TOKEN，无法发送仓库邀请。"
+            echo "::error::未配置 secret LABA_REPO_ADMIN_TOKEN，无法发送组织邀请。"
             echo "configured=false" >> "$GITHUB_OUTPUT"
           else
             # 遮蔽日志中的 token 形态，作为防泄漏的最后一道保险。
@@ -153,8 +164,15 @@ jobs:
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # ── 3. 核心逻辑：检查现有权限/邀请，然后按需发送邀请 ─────────────────────
-      - name: 发送仓库贡献权限邀请
+      # ── 3. 核心逻辑：加入 Organization，再同步 LABA-Members Team 归属 ────────
+      #
+      # 设计要点（为什么分成「组织」+「Team」两段）：
+      # · 权限模型是 Organization → Team → Repository，本 workflow 只管「把人放进来」，
+      #   不碰任何仓库级权限配置，因此今后新增项目无需改动本文件。
+      # · 组织邀请与 Team 加入是两个独立结果，必须分别上报：
+      #   邀请发出但 Team 加入失败时，用户仍会收到组织邀请，
+      #   因此评论必须明确告知「已邀请，但 Team 归属待管理员确认」，不能笼统说成功。
+      - name: 邀请加入组织并同步 Team
         id: invite
         if: steps.validate.outputs.should_process == 'true' && steps.creds.outputs.configured == 'true'
         uses: actions/github-script@v7
@@ -164,13 +182,15 @@ jobs:
           APPLICANT: ${{ github.event.issue.user.login }}
         with:
           # 注意：github-token 用的是 GITHUB_TOKEN，只用于在 Issue 里发评论。
-          # 所有 Administration 类请求在脚本内部用 ADMIN_TOKEN 单独发起。
+          # 所有组织成员管理类请求在脚本内部用 ADMIN_TOKEN 单独发起。
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            // 固定目标：LABA 的 first-contributions 仓库，权限为 push（即 Write）。
-            const OWNER = 'wustLABA';
-            const REPO = 'first-contributions';
-            const PERMISSION = 'push';
+            // 固定目标：wustLABA 组织 + LABA-Members Team。
+            const ORG = 'wustLABA';
+            // Team 显示名。GitHub API 的成员关系接口要求用 slug，下面是显示名，
+            // 真实 slug 必须先查询、再使用，绝不能直接拿显示名拼 URL。
+            const TEAM_NAME = 'LABA-Members';
+            const MEMBER_ROLE = 'member';
 
             const applicant = process.env.APPLICANT;
             // token 从不打印；仅用于构造 Authorization 头。
@@ -200,64 +220,134 @@ jobs:
               };
             }
 
-            const results = { decision: 'unknown', detail: '' };
-            try {
-              // ── 情况 1：申请人已经是本仓库 collaborator（已有 Write 权限）────────
-              // 404 表示目前还不是协作者，属于正常路径。
-              const perm = await adminApi('GET', `/repos/${OWNER}/${REPO}/collaborators/${applicant}/permission`);
-              if (perm.ok && ['admin', 'write', 'maintain'].includes(perm.data?.permission)) {
-                results.decision = 'already_collaborator';
-                results.detail = `当前权限: ${perm.data.permission}`;
-                console.log(`申请人已是协作者，权限=${perm.data.permission}，无需重复邀请。`);
-              } else if (perm.status !== 404 && !perm.ok) {
-                // 非 404 的失败说明凭据或仓库配置有问题，直接抛出走失败分支。
-                throw new Error(`查询协作者权限失败: HTTP ${perm.status} ${perm.message}`);
-              } else {
-                // ── 情况 2：是否已有 pending invitation ──────────────────────────
-                // 逐页扫描本仓库待接受邀请，避免重复创建大量邀请。
-                let pending = null;
-                for (let page = 1; page <= 10 && !pending; page++) {
-                  const inv = await adminApi('GET', `/repos/${OWNER}/${REPO}/invitations?per_page=100&page=${page}`);
-                  if (!inv.ok) {
-                    throw new Error(`查询待接受邀请失败: HTTP ${inv.status} ${inv.message}`);
-                  }
-                  const list = Array.isArray(inv.data) ? inv.data : [];
-                  if (list.length === 0) break;
-                  pending = list.find((i) => i?.invitee?.login?.toLowerCase() === applicant.toLowerCase()) || null;
-                  if (list.length < 100) break;
-                }
+            const results = { decision: 'unknown', team: 'unknown', detail: '' };
 
-                if (pending) {
-                  results.decision = 'already_invited';
-                  results.detail = `邀请 ID: ${pending.id}`;
-                  console.log('已存在待接受的邀请，不重复发送。');
-                } else {
-                  // ── 情况 3：首次申请，创建邀请 ────────────────────────────────
-                  const created = await adminApi(
-                    'PUT',
-                    `/repos/${OWNER}/${REPO}/collaborators/${applicant}`,
-                    { permission: PERMISSION },
+            // 403 一律判定为「凭据权限不足」，与业务失败严格区分：
+            // 前者需要管理员调整 Token，后者可能是用户状态或 Team 配置问题。
+            function isPermissionDenied(r) {
+              return r.status === 403 || /not accessible by|Resource not accessible/i.test(r.message);
+            }
+
+            // 解析 LABA-Members 的真实 slug。
+            // 为什么必须查询而不能硬编码：GitHub 的成员关系接口只认 slug，
+            // 而 slug 由显示名推导后可能被改写（大小写折叠、保留字冲突等），
+            // 直接假设 'LABA-Members' 一旦猜错就会 404，且错误现象难以排查。
+            async function resolveTeamSlug() {
+              for (let page = 1; page <= 10; page++) {
+                const res = await adminApi('GET', `/orgs/${ORG}/teams?per_page=100&page=${page}`);
+                if (!res.ok) {
+                  if (isPermissionDenied(res)) {
+                    throw Object.assign(
+                      new Error('查询组织 Team 列表被拒绝，Token 缺少 Organization Members 读权限。'),
+                      { code: 'TOKEN_PERMISSION_INSUFFICIENT' },
+                    );
+                  }
+                  throw Object.assign(
+                    new Error(`查询组织 Team 列表失败: HTTP ${res.status} ${res.message}`),
+                    { code: 'invite_failed' },
                   );
-
-                  // 201 = 新邀请已创建；204 = 该用户此前已被添加（幂等成功）。
-                  if (created.status === 201 || created.status === 204) {
-                    results.decision = 'invited';
-                    results.detail = `HTTP ${created.status}`;
-                    console.log(`邀请发送成功（HTTP ${created.status}）。`);
-                  } else {
-                    throw new Error(`创建邀请失败: HTTP ${created.status} ${created.message}`);
-                  }
                 }
+                const list = Array.isArray(res.data) ? res.data : [];
+                const hit = list.find(
+                  (t) => t?.name?.toLowerCase() === TEAM_NAME.toLowerCase()
+                       || t?.slug?.toLowerCase() === TEAM_NAME.toLowerCase(),
+                );
+                if (hit?.slug) return hit.slug;
+                if (list.length < 100) break;
+              }
+              // 找不到 Team 属于配置问题，不是权限问题，单独给出可读原因。
+              throw Object.assign(
+                new Error(`组织 ${ORG} 中未找到名为 ${TEAM_NAME} 的 Team，请确认 Team 是否存在。`),
+                { code: 'TEAM_NOT_FOUND' },
+              );
+            }
+
+            try {
+              // ── 第一段：Organization 成员关系 ────────────────────────────────
+              // 该接口对非成员返回 404，因此 404 表示「尚未加入」，属于正常路径。
+              const ms = await adminApi('GET', `/orgs/${ORG}/memberships/${applicant}`);
+
+              if (ms.ok && ms.data?.state === 'active') {
+                // 情况 A：已经是组织成员，绝不重复邀请。
+                results.decision = 'already_member';
+                results.detail = '已加入组织';
+                console.log('申请人已是组织成员，跳过邀请，继续检查 Team 归属。');
+              } else if (ms.ok && ms.data?.state === 'pending') {
+                // 情况 B：已有待接受的组织邀请，绝不重复发送。
+                results.decision = 'already_invited';
+                results.detail = '组织邀请待接受';
+                console.log('已存在待接受的组织邀请，不重复发送。');
+              } else if (ms.status === 404) {
+                // 情况 C：尚未加入，创建组织邀请。
+                const created = await adminApi('PUT', `/orgs/${ORG}/memberships/${applicant}`, {
+                  role: MEMBER_ROLE,
+                });
+                // 200 = 已是成员（幂等成功）；201 = 新邀请已创建。
+                if (created.status === 200 || created.status === 201) {
+                  results.decision = 'organization_invited';
+                  results.detail = `HTTP ${created.status}`;
+                  console.log(`组织邀请已发送（HTTP ${created.status}）。`);
+                } else if (isPermissionDenied(created)) {
+                  throw Object.assign(
+                    new Error('创建组织邀请被拒绝，Token 缺少 Organization Members 写权限。'),
+                    { code: 'TOKEN_PERMISSION_INSUFFICIENT' },
+                  );
+                } else {
+                  throw Object.assign(
+                    new Error(`创建组织邀请失败: HTTP ${created.status} ${created.message}`),
+                    { code: 'invite_failed' },
+                  );
+                }
+              } else if (isPermissionDenied(ms)) {
+                throw Object.assign(
+                  new Error('查询组织成员关系被拒绝，Token 缺少 Organization Members 读权限。'),
+                  { code: 'TOKEN_PERMISSION_INSUFFICIENT' },
+                );
+              } else {
+                throw Object.assign(
+                  new Error(`查询组织成员关系失败: HTTP ${ms.status} ${ms.message}`),
+                  { code: 'invite_failed' },
+                );
+              }
+
+              // ── 第二段：LABA-Members Team 归属 ───────────────────────────────
+              // 无论组织侧是「新邀请」「已有邀请」还是「已是成员」都继续执行：
+              // · 已是成员 → 补齐可能缺失的 Team 归属（这正是幂等的关键）；
+              // · 已有邀请 / 新邀请 → 先把 Team 归属准备好，用户接受邀请后即刻生效。
+              const slug = await resolveTeamSlug();
+              console.log(`已解析 Team slug: ${slug}`);
+
+              const tm = await adminApi(
+                'PUT',
+                `/orgs/${ORG}/teams/${encodeURIComponent(slug)}/memberships/${applicant}`,
+                { role: MEMBER_ROLE },
+              );
+              // 200 = 加入成功（重复调用同样返回 200，天然幂等）。
+              if (tm.ok && tm.status === 200) {
+                results.team = 'team_joined';
+                console.log('Team 成员关系已同步。');
+              } else if (isPermissionDenied(tm)) {
+                throw Object.assign(
+                  new Error('同步 Team 成员关系被拒绝，Token 缺少 Organization Members 写权限。'),
+                  { code: 'TOKEN_PERMISSION_INSUFFICIENT' },
+                );
+              } else {
+                throw Object.assign(
+                  new Error(`加入 Team 失败: HTTP ${tm.status} ${tm.message}`),
+                  { code: 'team_failed' },
+                );
               }
             } catch (err) {
               // 记录技术原因（不含 token/请求头），供管理员排障。
-              core.error(`授权流程异常: ${err.message}`);
-              results.decision = 'failed';
+              core.error(`授权流程异常[${err.code || 'unknown'}]: ${err.message}`);
+              results.decision = err.code || 'failed';
               results.detail = err.message;
+              results.team = 'not_applied';
             }
 
             core.setOutput('decision', results.decision);
             core.setOutput('detail', results.detail);
+            core.setOutput('team', results.team);
 
       # ── 4. 按结果在 Issue 中回复 ─────────────────────────────────────────────
       - name: 在 Issue 中回复处理结果
@@ -267,36 +357,89 @@ jobs:
         env:
           DECISION: ${{ steps.invite.outputs.decision }}
           DETAIL: ${{ steps.invite.outputs.detail }}
+          TEAM_RESULT: ${{ steps.invite.outputs.team }}
           CREDS_OK: ${{ steps.creds.outputs.configured }}
           APPLICANT: ${{ github.event.issue.user.login }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const decision = process.env.DECISION || '';
+            const team = process.env.TEAM_RESULT || '';
             const applicant = process.env.APPLICANT;
 
-            // 统一按 LABA 规定的话术回复。文案集中在此，便于后续统一修改。
+            // 组织邀请成功后需要用户操作的统一指引。文案集中在此，便于后续统一修改。
+            const NEXT_STEPS =
+              `下一步：\n\n` +
+              `1. 打开 **GitHub Notifications**（右上角铃铛 🔔）\n` +
+              `2. 接受 **wustLABA Organization** 邀请\n` +
+              `3. 邀请接受后你即成为 **LABA-Members** 团队成员\n` +
+              `4. 之后即可参与 LABA 公开项目开发\n\n` +
+              `接受邀请后即可 Clone 仓库：\n\n` +
+              `\`\`\`bash\n` +
+              `git clone https://github.com/wustLABA/first-contributions.git\n` +
+              `\`\`\``;
+
+            // 统一按 LABA 规定的话术回复。
+            // 注意：绝不出现 Token、Secret、API 路径、权限细节等内部信息。
             const MESSAGES = {
-              already_collaborator:
-                `@${applicant} 你已经拥有 LABA First Contribution 仓库的贡献权限，无需重复申请。`,
-              already_invited:
-                `@${applicant} 你的仓库邀请已经发送，请前往 GitHub Notifications 或邮件中接受邀请。`,
-              invited:
-                `@${applicant} LABA First Contribution 权限邀请已发送。\n\n` +
-                `请先接受 GitHub 仓库邀请。\n\n` +
-                `接受后，你就可以 Clone：\n\n` +
-                `https://github.com/wustLABA/first-contributions.git\n\n` +
-                `之后请按照 LABA 指南完成你的第一次贡献。`,
-              failed:
-                `@${applicant} 自动权限申请暂时失败。\n\n请联系 LABA 管理员处理。`,
+              // 组织邀请已发出 + Team 已同步 —— 完整成功
+              organization_invited_team_ok:
+                `@${applicant} 你的 LABA GitHub Organization 加入申请已处理。\n\n` +
+                `已向你发送 **wustLABA** 组织邀请，并已将你加入 **LABA-Members** 团队。\n\n` +
+                NEXT_STEPS,
+              // 已是组织成员 + Team 已同步 —— 幂等成功
+              already_member_team_ok:
+                `@${applicant} 你已经是 **wustLABA** 组织成员，无需重复申请。\n\n` +
+                `你已处于 **LABA-Members** 团队中，可以直接参与项目开发。`,
+              // 组织邀请已存在（待接受）+ Team 已同步
+              already_invited_team_ok:
+                `@${applicant} 你的 LABA GitHub Organization 加入申请已处理。\n\n` +
+                `你有一条**待接受**的 **wustLABA** 组织邀请（不会重复发送），` +
+                `并且已将你加入 **LABA-Members** 团队。\n\n` +
+                NEXT_STEPS,
+              // 组织邀请已发出，但 Team 同步失败 —— 半成功，必须如实说明
+              organization_invited_team_pending:
+                `@${applicant} 你的 LABA GitHub Organization 加入申请已处理。\n\n` +
+                `已向你发送 **wustLABA** 组织邀请。\n\n` +
+                `团队归属的自动同步尚未完成，管理员会尽快为你处理，` +
+                `你不必重复提交申请。\n\n` +
+                NEXT_STEPS,
+              already_member_team_pending:
+                `@${applicant} 你已经是 **wustLABA** 组织成员。\n\n` +
+                `团队归属的自动同步尚未完成，管理员会尽快为你处理，` +
+                `你不必重复提交申请。`,
+              already_invited_team_pending:
+                `@${applicant} 你有一条**待接受**的 **wustLABA** 组织邀请（不会重复发送）。\n\n` +
+                `接受邀请后若仍未进入团队，管理员会为你处理，你不必重复提交申请。\n\n` +
+                NEXT_STEPS,
+              // 凭据权限不足 —— 必须明确告知是管理员侧问题，用户无需重试
+              TOKEN_PERMISSION_INSUFFICIENT:
+                `@${applicant} 自动加入流程暂时失败（管理员凭据权限不足）。\n\n` +
+                `这与你无关，**不需要**重复提交申请。\n\n` +
+                `请联系 LABA 管理员处理。`,
+              // Team 不存在等其他配置问题
+              TEAM_NOT_FOUND:
+                `@${applicant} 自动加入流程暂时失败（团队配置异常）。\n\n` +
+                `这与你无关，**不需要**重复提交申请。\n\n` +
+                `请联系 LABA 管理员处理。`,
+              invite_failed:
+                `@${applicant} 自动加入流程暂时失败。\n\n请联系 LABA 管理员处理。`,
+              team_failed:
+                `@${applicant} 已向你发送 **wustLABA** 组织邀请，但团队归属同步失败。\n\n` +
+                `请联系 LABA 管理员处理，不必重复提交申请。`,
             };
 
-            let body;
-            if (decision === 'failed' || !decision || decision === 'unknown') {
-              body = MESSAGES.failed;
+            const FAILED = ['TOKEN_PERMISSION_INSUFFICIENT', 'TEAM_NOT_FOUND', 'invite_failed', 'team_failed'];
+
+            // 先判定失败分支，再按「组织结果 + Team 结果」组合出具体话术。
+            let key;
+            if (FAILED.includes(decision) || !decision || decision === 'unknown') {
+              key = FAILED.includes(decision) ? decision : 'invite_failed';
             } else {
-              body = MESSAGES[decision] || MESSAGES.failed;
+              key = `${decision}_${team === 'team_joined' ? 'team_ok' : 'team_pending'}`;
             }
+
+            const body = MESSAGES[key] || MESSAGES.invite_failed;
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
@@ -305,7 +448,9 @@ jobs:
               body,
             });
 
-            core.setOutput('body_kind', body === MESSAGES.failed ? 'failed' : 'ok');
+            // 只有组织侧成功、且 Team 也确实同步完成，才算完整成功。
+            core.setOutput('body_kind',
+              (FAILED.includes(decision) || !decision || decision === 'unknown') ? 'failed' : key);
 
       # ── 5. 打标签 + 按需关闭 Issue ───────────────────────────────────────────
       - name: 打标签并关闭 Issue
@@ -313,16 +458,20 @@ jobs:
         uses: actions/github-script@v7
         env:
           DECISION: ${{ steps.invite.outputs.decision }}
+          TEAM_RESULT: ${{ steps.invite.outputs.team }}
           CREDS_OK: ${{ steps.creds.outputs.configured }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const decision = process.env.DECISION || '';
+            const team = process.env.TEAM_RESULT || '';
             const credsOk = process.env.CREDS_OK === 'true';
 
-            // 只有「已发送邀请 / 已有邀请 / 已有权限」才算成功；其余一律按失败处理。
+            // 只有「组织侧已处理」且「Team 已同步」才算成功；其余一律按失败处理。
             // 凭据未配置时 decision 为空，同样归入失败分支，保证绝不静默失败。
-            const success = credsOk && ['invited', 'already_invited', 'already_collaborator'].includes(decision);
+            // 本 workflow 不存在任何仓库级授权路径，因此判定条件只有组织与 Team 两项。
+            const ORG_OK = ['organization_invited', 'already_invited', 'already_member'];
+            const success = credsOk && ORG_OK.includes(decision) && team === 'team_joined';
 
             const addLabel = success ? 'laba-access-approved' : 'laba-access-failed';
 
@@ -345,7 +494,9 @@ jobs:
               console.log(`处理成功，已添加 ${addLabel} 并关闭 Issue。`);
             } else {
               // 失败路径：保持开启，方便管理员人工接手。
-              console.log(`处理失败，已添加 ${addLabel}，Issue 保持开启等待人工处理。`);
+              // 这里包含「组织邀请已发出但 Team 未同步」的半成功情况 —— 必须保持开启，
+              // 否则管理员会失去这条待跟进的记录。
+              console.log(`处理未完整完成（组织=${decision}, Team=${team}），已添加 ${addLabel}，Issue 保持开启。`);
             }
 
       # ── 6. 被拒绝申请的兜底回复（绝不授予任何权限）───────────────────────────
@@ -378,7 +529,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: `@${applicant} 自动权限申请暂时失败。\n\n请联系 LABA 管理员处理。`,
+              body: `@${applicant} 自动加入流程暂时失败。\n\n请联系 LABA 管理员处理。`,
             });
 
             await github.rest.issues.addLabels({

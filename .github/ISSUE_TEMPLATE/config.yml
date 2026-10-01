@@ -2,7 +2,7 @@
 #
 # 为什么显式设置 blank_issues_enabled: false：
 # 本仓库是公开的招新仓库，任何人都能提交 Issue。
-# 强制使用模板可以保证 LABA 权限申请必定带有固定结构与 [LABA Access] 标题前缀，
+# 强制使用模板可以保证 LABA 入组申请必定带有固定结构与 [LABA Access] 标题前缀，
 # 使 laba-auto-invite.yml 的识别条件可靠、可验证，避免自由格式 Issue 混入。
 #
 # 同时提供联系渠道，避免新生在无法开 Issue 时无处求助。
@@ -10,7 +10,7 @@
 blank_issues_enabled: false
 
 contact_links:
-  - name: LABA First Contribution 权限申请说明
+  - name: LABA Organization 加入申请说明
     url: https://github.com/wustLABA/first-contributions/blob/main/docs/zh-CN/laba-access.md
     about: 申请流程、如何接受邀请、以及第一次贡献的完整中文指南。
   - name: 我有其他问题需要人工协助
